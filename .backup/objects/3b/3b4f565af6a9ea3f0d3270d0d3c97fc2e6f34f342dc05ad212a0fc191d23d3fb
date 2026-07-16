@@ -1,0 +1,474 @@
+package com.java.myapplication
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.Dashboard
+import androidx.compose.material.icons.outlined.Extension
+import androidx.compose.material.icons.outlined.Policy
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.java.myapplication.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MyApplicationTheme(darkTheme = true, dynamicColor = false) {
+                RootWatchApp(controller = remember { RootMonitorController(applicationContext) })
+            }
+        }
+    }
+}
+
+private enum class Page(val title: String, val icon: ImageVector) {
+    Dashboard("监控", Icons.Outlined.Dashboard),
+    Modules("模块", Icons.Outlined.Extension),
+    Guard("保护", Icons.Outlined.Security),
+    Settings("设置", Icons.Outlined.Settings)
+}
+
+@Composable
+private fun RootWatchApp(controller: RootMonitorController) {
+    val scope = rememberCoroutineScope()
+    var page by remember { mutableStateOf(Page.Dashboard) }
+    var rootStatus by remember { mutableStateOf(RootStatus(false, "检测中", "未知", "")) }
+    var target by remember { mutableStateOf("") }
+    var inspection by remember { mutableStateOf<TargetInspection?>(null) }
+    var moduleScan by remember { mutableStateOf(ModuleScan(emptyList(), emptyList(), emptyList())) }
+    var superProtection by remember { mutableStateOf(true) }
+    var command by remember { mutableStateOf("rm -rf /system") }
+    var commandOutput by remember { mutableStateOf("等待检测命令") }
+    var busy by remember { mutableStateOf(false) }
+
+    fun refreshRoot() {
+        scope.launch {
+            busy = true
+            rootStatus = controller.checkRoot()
+            moduleScan = controller.scanModules()
+            busy = false
+        }
+    }
+
+    fun inspect() {
+        scope.launch {
+            busy = true
+            inspection = controller.inspectTarget(target)
+            busy = false
+        }
+    }
+
+    LaunchedEffect(Unit) { refreshRoot() }
+
+    Scaffold(
+        containerColor = AppColors.Background,
+        bottomBar = { GlassBottomBar(page = page, onPageChange = { page = it }) }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(AppColors.Background)
+                .padding(padding)
+                .padding(horizontal = 16.dp)
+        ) {
+            TopHeader(rootStatus, busy, onRefresh = ::refreshRoot)
+            Spacer(Modifier.height(14.dp))
+            AnimatedContent(targetState = page, label = "page") { selected ->
+                when (selected) {
+                    Page.Dashboard -> DashboardPage(
+                        target = target,
+                        onTargetChange = { target = it },
+                        inspection = inspection,
+                        busy = busy,
+                        onInspect = ::inspect
+                    )
+                    Page.Modules -> ModulesPage(moduleScan)
+                    Page.Guard -> GuardPage(
+                        superProtection = superProtection,
+                        onProtectionChange = { superProtection = it },
+                        command = command,
+                        onCommandChange = { command = it },
+                        output = commandOutput,
+                        onDryRun = {
+                            val decision = controller.evaluateCommand(command, superProtection)
+                            commandOutput = if (decision.blocked) "会被终止: ${decision.reason}" else "允许执行: ${decision.reason}"
+                        },
+                        onRun = {
+                            scope.launch {
+                                busy = true
+                                val result = controller.runGuardedRootCommand(command, superProtection)
+                                commandOutput = "exit=${result.exitCode}\n${result.output}"
+                                busy = false
+                            }
+                        }
+                    )
+                    Page.Settings -> SettingsPage(rootStatus, superProtection)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopHeader(rootStatus: RootStatus, busy: Boolean, onRefresh: () -> Unit) {
+    Column(modifier = Modifier.padding(top = 18.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Root Sentinel", color = AppColors.TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.SemiBold)
+                Text("LSP/XSP 模块行为与权限调用观察台", color = AppColors.TextMuted, fontSize = 13.sp)
+            }
+            IconButton(onClick = onRefresh) {
+                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = AppColors.Accent)
+                else Icon(Icons.Outlined.Bolt, contentDescription = "刷新", tint = AppColors.Accent)
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Card(
+            colors = CardDefaults.cardColors(containerColor = AppColors.Panel),
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, AppColors.Border, RoundedCornerShape(8.dp))
+        ) {
+            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                StatusDot(rootStatus.available)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(if (rootStatus.available) "Root 已授权" else "Root 未就绪", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                    Text("${rootStatus.manager}  ·  SELinux ${rootStatus.selinux}", color = AppColors.TextMuted, fontSize = 12.sp)
+                }
+                Text(if (rootStatus.available) "ACTIVE" else "LOCKED", color = if (rootStatus.available) AppColors.Accent else AppColors.Warning, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DashboardPage(
+    target: String,
+    onTargetChange: (String) -> Unit,
+    inspection: TargetInspection?,
+    busy: Boolean,
+    onInspect: () -> Unit
+) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            Panel {
+                Text("目标应用", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = target,
+                        onValueChange = onTargetChange,
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("包名或应用名") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { onInspect() })
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = onInspect, enabled = !busy, colors = ButtonDefaults.buttonColors(containerColor = AppColors.Accent)) {
+                        Icon(Icons.Outlined.Search, contentDescription = null, Modifier.size(18.dp))
+                    }
+                }
+            }
+        }
+        item { RiskOverview(inspection) }
+        items(inspection?.events.orEmpty()) { event -> EventRow(event) }
+        item {
+            Text(
+                text = inspection?.note ?: "输入目标后会汇总 Manifest 权限、AppOps 状态、模块命中线索和风险评分。",
+                color = AppColors.TextMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun RiskOverview(inspection: TargetInspection?) {
+    Panel {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(inspection?.label ?: "未选择目标", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(inspection?.packageName ?: "等待输入", color = AppColors.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Text("${inspection?.riskScore ?: 0}%", color = AppColors.Accent, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        }
+        Spacer(Modifier.height(14.dp))
+        LinearProgressIndicator(
+            progress = { (inspection?.riskScore ?: 0) / 100f },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(RoundedCornerShape(8.dp)),
+            color = AppColors.Accent,
+            trackColor = AppColors.Track
+        )
+        Spacer(Modifier.height(14.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricChip("权限", "${inspection?.permissionCount ?: 0}", Modifier.weight(1f))
+            MetricChip("AppOps", "${inspection?.appOps?.size ?: 0}", Modifier.weight(1f))
+            MetricChip("模块线索", "${inspection?.moduleSignals?.size ?: 0}", Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun ModulesPage(scan: ModuleScan) {
+    LazyColumn(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 12.dp)
+    ) {
+        item { SectionTitle("Root 模块", "Magisk 模块独立列出，包含启用状态、版本和路径") }
+        items(scan.rootModules) { module -> ModuleCard(module, Icons.Outlined.Security) }
+        item { SectionTitle("LSP / XSP 模块", "扫描 LSPosed 常见数据目录、模块 APK 与作用域配置线索") }
+        items(scan.lspModules) { module -> ModuleCard(module, Icons.Outlined.Extension) }
+        item { SectionTitle("实用检查", "Zygisk、DenyList、系统分区挂载、hosts 与 su 暴露状态") }
+        items(scan.securityChecks) { check -> SecurityCheckCard(check) }
+    }
+}
+
+@Composable
+private fun GuardPage(
+    superProtection: Boolean,
+    onProtectionChange: (Boolean) -> Unit,
+    command: String,
+    onCommandChange: (String) -> Unit,
+    output: String,
+    onDryRun: () -> Unit,
+    onRun: () -> Unit
+) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            Panel {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Policy, contentDescription = null, tint = AppColors.Accent)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("超级保护", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                        Text("阻止删除系统分区、根目录与关键模块路径", color = AppColors.TextMuted, fontSize = 12.sp)
+                    }
+                    Switch(checked = superProtection, onCheckedChange = onProtectionChange)
+                }
+            }
+        }
+        item {
+            Panel {
+                Text("Root 命令沙箱", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = command,
+                    onValueChange = onCommandChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("命令") },
+                    minLines = 2
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onDryRun, modifier = Modifier.weight(1f)) { Text("仅检测") }
+                    Button(onClick = onRun, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = AppColors.Accent)) {
+                        Icon(Icons.Outlined.Terminal, contentDescription = null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("执行")
+                    }
+                }
+            }
+        }
+        item { ConsolePanel(output) }
+        item {
+            Text(
+                "说明：此保护能覆盖本应用发起的 root 操作。要终止其它应用或模块进程的危险文件操作，需要 companion Magisk/LSPosed 模块在系统层上报并执行 kill。",
+                color = AppColors.TextMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsPage(rootStatus: RootStatus, superProtection: Boolean) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        item { SectionTitle("运行状态", "策略、审计与后续接入点") }
+        item { SettingRow("Root 管理器", rootStatus.manager) }
+        item { SettingRow("SELinux", rootStatus.selinux) }
+        item { SettingRow("超级保护", if (superProtection) "启用" else "关闭") }
+        item { SettingRow("实时 Hook", "等待 companion 模块") }
+        item { SettingRow("日志策略", "本地内存快照，未上传") }
+    }
+}
+
+@Composable
+private fun EventRow(event: MonitorEvent) {
+    Panel {
+        Row(verticalAlignment = Alignment.Top) {
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .background(severityColor(event.severity).copy(alpha = 0.16f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(event.severity, color = severityColor(event.severity), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("${event.source} · ${event.name}", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(event.detail, color = AppColors.TextSecondary, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Panel(content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = AppColors.Panel),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, AppColors.Border, RoundedCornerShape(8.dp))
+    ) {
+        Column(Modifier.padding(14.dp), content = content)
+    }
+}
+
+@Composable
+private fun MetricChip(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(AppColors.Chip)
+            .padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(value, color = AppColors.TextPrimary, fontWeight = FontWeight.Bold)
+        Text(label, color = AppColors.TextMuted, fontSize = 11.sp)
+    }
+}
+
+@Composable
+private fun ConsolePanel(output: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(AppColors.Console)
+            .border(1.dp, AppColors.Border, RoundedCornerShape(8.dp))
+            .padding(14.dp)
+    ) {
+        Text(output, color = AppColors.ConsoleText, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun SectionTitle(title: String, subtitle: String) {
+    Column(Modifier.padding(top = 4.dp, bottom = 2.dp)) {
+        Text(title, color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+        Text(subtitle, color = AppColors.TextMuted, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun SettingRow(label: String, value: String) {
+    Panel {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = AppColors.TextPrimary, modifier = Modifier.weight(1f))
+            Text(value, color = AppColors.Accent, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun StatusDot(active: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(12.dp)
+            .clip(CircleShape)
+            .background(if (active) AppColors.Accent else AppColors.Warning)
+    )
+}
+
+private fun severityColor(severity: String): Color = when (severity) {
+    "高" -> AppColors.Danger
+    "中" -> AppColors.Warning
+    else -> AppColors.Accent
+}
+
+private object AppColors {
+    val Background = Color(0xFF080D10)
+    val BottomBar = Color(0xFF0D1418)
+    val Panel = Color(0xFF10191E)
+    val Chip = Color(0xFF172329)
+    val Console = Color(0xFF05090B)
+    val Track = Color(0xFF223036)
+    val Border = Color(0xFF203139)
+    val Accent = Color(0xFF42E0B5)
+    val Warning = Color(0xFFFFC857)
+    val Danger = Color(0xFFFF5D73)
+    val TextPrimary = Color(0xFFE9F3F1)
+    val TextSecondary = Color(0xFFB8C7C4)
+    val TextMuted = Color(0xFF7F9290)
+    val ConsoleText = Color(0xFF9EF5D5)
+}
