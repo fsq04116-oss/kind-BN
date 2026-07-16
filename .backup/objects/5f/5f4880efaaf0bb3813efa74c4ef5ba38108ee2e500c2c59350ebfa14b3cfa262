@@ -1,0 +1,499 @@
+package com.java.myapplication
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.Extension
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.VerifiedUser
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.java.myapplication.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MyApplicationTheme(darkTheme = false, dynamicColor = false) {
+                ShellGuardApp(remember { RootMonitorController(applicationContext) })
+            }
+        }
+    }
+}
+
+private enum class Page(val title: String, val icon: ImageVector) {
+    Shell("脚本", Icons.Outlined.Code),
+    Modules("模块", Icons.Outlined.Extension),
+    Guard("保护", Icons.Outlined.Security),
+    Settings("终端", Icons.Outlined.Terminal)
+}
+
+@Composable
+private fun ShellGuardApp(controller: RootMonitorController) {
+    val scope = rememberCoroutineScope()
+    var page by remember { mutableStateOf(Page.Shell) }
+    var root by remember { mutableStateOf(RootStatus(false, "检测中", "未知", "")) }
+    var scan by remember { mutableStateOf(ModuleScan(emptyList(), emptyList(), emptyList(), emptyList())) }
+    var busy by remember { mutableStateOf(false) }
+
+    var scriptPath by remember { mutableStateOf("/data/adb/script.sh") }
+    var workDir by remember { mutableStateOf("/data/adb") }
+    var asRoot by remember { mutableStateOf(true) }
+    var protection by remember { mutableStateOf(true) }
+    var output by remember { mutableStateOf("等待执行脚本") }
+    var chmodMode by remember { mutableStateOf("777") }
+    var terminalDialog by remember { mutableStateOf(false) }
+
+    fun refresh() {
+        scope.launch {
+            busy = true
+            root = controller.checkRoot()
+            scan = controller.scanModules()
+            busy = false
+        }
+    }
+
+    LaunchedEffect(Unit) { refresh() }
+
+    Scaffold(
+        containerColor = AppColors.Background,
+        bottomBar = {
+            BottomBar(page) { page = it }
+        }
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(AppColors.Background)
+                .padding(padding)
+                .padding(horizontal = 16.dp)
+        ) {
+            Header(root, busy, onRefresh = ::refresh)
+            Spacer(Modifier.height(12.dp))
+            when (page) {
+                Page.Shell -> ShellPage(
+                    scriptPath = scriptPath,
+                    onScriptPath = { scriptPath = it },
+                    workDir = workDir,
+                    onWorkDir = { workDir = it },
+                    asRoot = asRoot,
+                    onAsRoot = { asRoot = it },
+                    protection = protection,
+                    onProtection = { protection = it },
+                    output = output,
+                    chmodMode = chmodMode,
+                    onChmodMode = { chmodMode = it },
+                    busy = busy,
+                    onChmod = {
+                        scope.launch {
+                            busy = true
+                            val r = controller.prepareScript(scriptPath)
+                            output = "chmod exit=${r.exitCode}\n${r.output}"
+                            busy = false
+                        }
+                    },
+                    onRun = {
+                        scope.launch {
+                            busy = true
+                            val r = controller.runScript(scriptPath, workDir, asRoot, protection)
+                            output = "exit=${r.exitCode}\n${r.output}"
+                            busy = false
+                        }
+                    }
+                )
+                Page.Modules -> ModulesPage(scan)
+                Page.Guard -> GuardPage(protection, onProtection = { protection = it }, scriptPath = scriptPath, output = output)
+                Page.Settings -> SettingsPage(
+                    root = root,
+                    workDir = workDir,
+                    onOpenTerminal = { terminalDialog = true }
+                )
+            }
+        }
+    }
+
+    if (terminalDialog) {
+        TerminalDialog(
+            controller = controller,
+            workDir = workDir,
+            asRoot = asRoot,
+            onDismiss = { terminalDialog = false }
+        )
+    }
+}
+
+@Composable
+private fun Header(root: RootStatus, busy: Boolean, onRefresh: () -> Unit) {
+    Column(Modifier.padding(top = 18.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("ADB Script Guard", color = AppColors.TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text("Shell 脚本执行 · Root 模块 · KSU WebUI", color = AppColors.TextMuted, fontSize = 13.sp)
+            }
+            IconButton(onClick = onRefresh) {
+                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = AppColors.Accent)
+                else Icon(Icons.Outlined.VerifiedUser, contentDescription = "刷新", tint = AppColors.Accent)
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Panel {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                StatusDot(root.available)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(if (root.available) "Root 已授权" else "Root 未就绪", color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                    Text("${root.manager} · SELinux ${root.selinux}", color = AppColors.TextMuted, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShellPage(
+    scriptPath: String,
+    onScriptPath: (String) -> Unit,
+    workDir: String,
+    onWorkDir: (String) -> Unit,
+    asRoot: Boolean,
+    onAsRoot: (Boolean) -> Unit,
+    protection: Boolean,
+    onProtection: (Boolean) -> Unit,
+    output: String,
+    busy: Boolean,
+    onChmod: () -> Unit,
+    onRun: () -> Unit
+) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
+        item {
+            Panel {
+                Text("执行 Shell 脚本", color = AppColors.TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = scriptPath,
+                    onValueChange = onScriptPath,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("脚本路径") },
+                    leadingIcon = { Icon(Icons.Outlined.Code, null) },
+                    singleLine = true
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = workDir,
+                    onValueChange = onWorkDir,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("工作目录，默认 /data/adb") },
+                    leadingIcon = { Icon(Icons.Outlined.Folder, null) },
+                    singleLine = true
+                )
+                ToggleRow("Root 执行", "使用 su -c 执行脚本", asRoot, onAsRoot)
+                ToggleRow("运行保护", "执行前扫描危险命令，命中立即终止", protection, onProtection)
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onChmod, modifier = Modifier.weight(1f), enabled = !busy) { Text("赋予执行权限") }
+                    Button(
+                        onClick = onRun,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = AppColors.Accent)
+                    ) {
+                        Icon(Icons.Outlined.PlayArrow, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("执行")
+                    }
+                }
+            }
+        }
+        item { Console(output) }
+        item { RightsFooter() }
+    }
+}
+
+@Composable
+private fun ModulesPage(scan: ModuleScan) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
+        item { SectionTitle("Root 模块", "Magisk / KernelSU 模块") }
+        items(scan.rootModules) { ModuleCard(it) }
+        item { SectionTitle("KSU WebUI", "扫描 webroot / index.html / webui 线索") }
+        items(scan.ksuWebUi) { ModuleCard(it) }
+        item { SectionTitle("LSP / XSP 模块", "LSPosed / Xposed 配置和 APK 线索") }
+        items(scan.lspModules) { ModuleCard(it) }
+        item { SectionTitle("环境检查", "工作目录、挂载、su 暴露") }
+        items(scan.securityChecks) { CheckCard(it) }
+        item { RightsFooter() }
+    }
+}
+
+@Composable
+private fun GuardPage(protection: Boolean, onProtection: (Boolean) -> Unit, scriptPath: String, output: String) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
+        item {
+            Panel {
+                ToggleRow("脚本运行保护", "开启后执行前检测危险脚本；命中规则不会执行", protection, onProtection)
+                Spacer(Modifier.height(8.dp))
+                Text("当前脚本：$scriptPath", color = AppColors.TextSecondary, fontSize = 13.sp)
+                Text("说明：Android 普通 App 无法可靠拦截其它进程所有文件操作；这里保护的是本工具启动的脚本执行链。", color = AppColors.TextMuted, fontSize = 12.sp)
+            }
+        }
+        item { Console(output) }
+        item { RightsFooter() }
+    }
+}
+
+@Composable
+private fun SettingsPage(root: RootStatus, workDir: String, onOpenTerminal: () -> Unit) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
+        item { SectionTitle("内置终端", "对话框终端，默认在当前工作目录执行") }
+        item {
+            Panel {
+                SettingRow("Root", root.manager)
+                SettingRow("SELinux", root.selinux)
+                SettingRow("默认目录", workDir)
+                Spacer(Modifier.height(10.dp))
+                Button(onClick = onOpenTerminal, colors = ButtonDefaults.buttonColors(containerColor = AppColors.Accent)) {
+                    Icon(Icons.Outlined.Terminal, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("打开终端对话框")
+                }
+            }
+        }
+        item { RightsFooter() }
+    }
+}
+
+@Composable
+private fun TerminalDialog(controller: RootMonitorController, workDir: String, asRoot: Boolean, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var command by remember { mutableStateOf("ls -la") }
+    var log by remember { mutableStateOf("内置终端已就绪\n$ $command") }
+    var busy by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("内置终端") },
+        text = {
+            Column {
+                OutlinedTextField(value = command, onValueChange = { command = it }, label = { Text("命令") }, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Console(log)
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !busy,
+                onClick = {
+                    scope.launch {
+                        busy = true
+                        val r = controller.runTerminal(command, workDir, asRoot)
+                        log = "$ $command\nexit=${r.exitCode}\n${r.output}"
+                        busy = false
+                    }
+                }
+            ) { Text("执行") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+    )
+}
+
+@Composable
+private fun ModuleCard(module: ModuleInfo) {
+    Panel {
+        Row(verticalAlignment = Alignment.Top) {
+            Icon(Icons.Outlined.Extension, null, tint = AppColors.Accent, modifier = Modifier.size(26.dp))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(module.name, color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    Text(module.state, color = stateColor(module.state), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(module.type, color = AppColors.TextMuted, fontSize = 12.sp)
+                Text(module.description, color = AppColors.TextSecondary, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (module.path.isNotBlank()) Text(module.path, color = AppColors.PathText, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CheckCard(check: SecurityCheck) {
+    Panel {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(check.name, color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+                Text(check.detail, color = AppColors.TextSecondary, fontSize = 13.sp)
+            }
+            Text(check.state, color = stateColor(check.state), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun Panel(content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = AppColors.Panel),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, AppColors.Border, RoundedCornerShape(14.dp))
+    ) { Column(Modifier.padding(14.dp), content = content) }
+}
+
+@Composable
+private fun ToggleRow(title: String, desc: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+            Text(desc, color = AppColors.TextMuted, fontSize = 12.sp)
+        }
+        Switch(checked = checked, onCheckedChange = onChecked)
+    }
+}
+
+@Composable
+private fun Console(text: String) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(AppColors.Console)
+            .border(1.dp, AppColors.Border, RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) { Text(text, color = AppColors.ConsoleText, fontSize = 12.sp) }
+}
+
+@Composable
+private fun SectionTitle(title: String, subtitle: String) {
+    Column(Modifier.padding(top = 4.dp)) {
+        Text(title, color = AppColors.TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(subtitle, color = AppColors.TextMuted, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun SettingRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = AppColors.TextMuted, modifier = Modifier.weight(1f))
+        Text(value, color = AppColors.TextPrimary, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun StatusDot(active: Boolean) {
+    Box(Modifier.size(10.dp).clip(CircleShape).background(if (active) AppColors.Accent else AppColors.Warning))
+}
+
+@Composable
+private fun BottomBar(page: Page, onPage: (Page) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(AppColors.Panel)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceAround
+    ) {
+        Page.entries.forEach {
+            val selected = it == page
+            Column(
+                Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onPage(it) }
+                    .background(if (selected) AppColors.AccentSoft else Color.Transparent)
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(it.icon, null, tint = if (selected) AppColors.Accent else AppColors.TextMuted, modifier = Modifier.size(20.dp))
+                Text(it.title, color = if (selected) AppColors.Accent else AppColors.TextMuted, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RightsFooter() {
+    Text(
+        "开源权益：可参考 GitHub 公开源码实现；请保留原作者 License/版权声明。本应用 UI 与功能封装由当前项目实现。",
+        color = AppColors.TextMuted,
+        fontSize = 11.sp,
+        modifier = Modifier.padding(vertical = 8.dp)
+    )
+}
+
+private fun stateColor(state: String): Color = when {
+    state.contains("风险") || state.contains("禁用") || state.contains("未命中") -> AppColors.Danger
+    state.contains("正常") || state.contains("启用") || state.contains("存在") || state.contains("发现") || state.contains("可用") -> AppColors.Accent
+    else -> AppColors.Warning
+}
+
+private object AppColors {
+    val Background = Color(0xFFF6F8FA)
+    val Panel = Color.White
+    val Console = Color(0xFF101418)
+    val Border = Color(0xFFE1E6EB)
+    val Accent = Color(0xFF1677FF)
+    val AccentSoft = Color(0xFFEAF3FF)
+    val Warning = Color(0xFFFFA726)
+    val Danger = Color(0xFFE53935)
+    val TextPrimary = Color(0xFF17212B)
+    val TextSecondary = Color(0xFF4B5B6B)
+    val TextMuted = Color(0xFF7A8794)
+    val PathText = Color(0xFF607D8B)
+    val ConsoleText = Color(0xFFE8F5E9)
+}
