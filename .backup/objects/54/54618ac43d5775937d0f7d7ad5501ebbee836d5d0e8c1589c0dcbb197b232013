@@ -1,0 +1,178 @@
+package com.java.myapplication
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
+
+class RootMonitorController(private val context: Context) {
+    private val dangerPatterns = listOf(
+        Regex("""(?i)\brm\s+(-[a-z]*r[a-z]*f|-rf|-fr)\s+(/|/system|/vendor|/product|/system_ext|/odm|/data/adb)(\s|/|$)"""),
+        Regex("""(?i)\bdd\s+if=.*\s+of=/dev/block/"""),
+        Regex("""(?i)\bmkfs\."""),
+        Regex("""(?i)\bmount\s+.*\brw\b.*\s(/|/system|/vendor|/product|/system_ext)"""),
+        Regex("""(?i)\bblockdev\s+--setrw"""),
+        Regex("""(?i)\bfastboot\s+erase""")
+    )
+
+    suspend fun checkRoot(): RootStatus = withContext(Dispatchers.IO) {
+        val r = runProcess(listOf("su", "-c", "id; getenforce; command -v magisk || true; command -v ksud || true"), 3500)
+        val rooted = r.output.contains("uid=0") || r.output.contains("magisk", true) || r.output.contains("ksud", true)
+        RootStatus(
+            available = rooted,
+            manager = when {
+                r.output.contains("ksud", true) -> "KernelSU / su"
+                r.output.contains("magisk", true) -> "Magisk / su"
+                rooted -> "su"
+                else -> "未授权"
+            },
+            selinux = r.output.lineSequence().firstOrNull { it == "Enforcing" || it == "Permissive" } ?: "未知",
+            raw = r.output.ifBlank { r.error.ifBlank { "无 root 响应" } }
+        )
+    }
+
+    suspend fun prepareScript(path: String): CommandResult = withContext(Dispatchers.IO) {
+        val p = path.trim()
+        if (p.isBlank()) return@withContext CommandResult(true, "脚本路径为空", -1, null)
+        val result = runProcess(listOf("su", "-c", "chmod 755 '$p' && ls -l '$p'"), 5000)
+        CommandResult(false, result.output.ifBlank { result.error }, result.exitCode, null)
+    }
+
+    fun evaluateScript(scriptPath: String, scriptContent: String, protection: Boolean): ProtectionDecision {
+        if (!protection) return ProtectionDecision(false, "运行保护未开启")
+        val text = "$scriptPath\n$scriptContent"
+        val hit = dangerPatterns.firstOrNull { it.containsMatchIn(text) }
+        return if (hit != null) ProtectionDecision(true, "脚本命中危险规则：${hit.pattern}")
+        else ProtectionDecision(false, "未发现危险规则")
+    }
+
+    suspend fun runScript(
+        scriptPath: String,
+        workingDir: String,
+        asRoot: Boolean,
+        protection: Boolean
+    ): CommandResult = withContext(Dispatchers.IO) {
+        val p = scriptPath.trim()
+        val dir = workingDir.trim().ifBlank { "/data/adb" }
+        if (p.isBlank()) return@withContext CommandResult(true, "请输入脚本路径", -1, null)
+
+        val content = runProcess(listOf("su", "-c", "cat '$p' 2>/dev/null || cat '$p'"), 2500).output
+        val decision = evaluateScript(p, content, protection)
+        if (decision.blocked) {
+            return@withContext CommandResult(true, "保护已终止：${decision.reason}", -9, null)
+        }
+
+        val shell = "cd '$dir' && chmod 755 '$p' 2>/dev/null; '$p'"
+        val cmd = if (asRoot) listOf("su", "-c", shell) else listOf("sh", "-c", shell)
+        val result = runProcess(cmd, 30000)
+        CommandResult(false, result.output.ifBlank { result.error }, result.exitCode, null)
+    }
+
+    suspend fun runTerminal(command: String, workingDir: String, asRoot: Boolean): CommandResult = withContext(Dispatchers.IO) {
+        val dir = workingDir.trim().ifBlank { "/data/adb" }
+        val shell = "cd '$dir' && $command"
+        val result = runProcess(if (asRoot) listOf("su", "-c", shell) else listOf("sh", "-c", shell), 30000)
+        CommandResult(false, result.output.ifBlank { result.error }, result.exitCode, null)
+    }
+
+    suspend fun scanModules(): ModuleScan = withContext(Dispatchers.IO) {
+        ModuleScan(
+            rootModules = scanRootModules(),
+            lspModules = scanLspModules(),
+            ksuWebUi = scanKsuWebUi(),
+            securityChecks = scanSecurityChecks()
+        )
+    }
+
+    private fun scanRootModules(): List<ModuleInfo> {
+        val out = runProcess(listOf("su", "-c", "find /data/adb/modules /data/adb/ksu/modules -maxdepth 2 -name module.prop -print 2>/dev/null || true"), 4000).output
+        return out.lineSequence().map { it.trim() }.filter { it.endsWith("module.prop") }.map { prop ->
+            val content = runProcess(listOf("su", "-c", "cat '$prop'"), 1500).output
+            val dir = prop.substringBeforeLast('/')
+            val id = content.lineValue("id") ?: dir.substringAfterLast('/')
+            ModuleInfo(
+                name = content.lineValue("name") ?: id,
+                type = if (dir.contains("/ksu/")) "KernelSU 模块" else "Magisk 模块",
+                state = if (runProcess(listOf("su", "-c", "test -f '$dir/disable' && echo disabled || echo enabled"), 1000).output.contains("disabled")) "已禁用" else "已启用",
+                description = "${content.lineValue("description") ?: "Root 模块"} · ${content.lineValue("version") ?: "unknown"}",
+                path = dir
+            )
+        }.distinctBy { it.path }.toList().ifEmpty {
+            listOf(ModuleInfo("未发现 Root 模块", "Root", "空", "未在 /data/adb/modules 或 /data/adb/ksu/modules 找到 module.prop", "/data/adb"))
+        }
+    }
+
+    private fun scanLspModules(): List<ModuleInfo> {
+        val cmd = "find /data/adb/lspd /data/adb/lsposed /data/misc/apexdata/org.lsposed.manager -maxdepth 5 \\( -name '*.apk' -o -name '*scope*' -o -name '*.json' -o -name '*.xml' \\) -print 2>/dev/null | head -n 80 || true"
+        val out = runProcess(listOf("su", "-c", cmd), 4000).output
+        return out.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.map {
+            ModuleInfo(it.substringAfterLast('/'), "LSPosed / Xposed", if (it.endsWith(".apk")) "模块 APK" else "配置线索", "作用域/模块配置线索", it)
+        }.toList().ifEmpty {
+            listOf(ModuleInfo("未发现 LSP 模块", "LSPosed", "未命中", "常见 LSPosed 目录未发现模块线索", "/data/adb/lspd"))
+        }
+    }
+
+    private fun scanKsuWebUi(): List<ModuleInfo> {
+        val cmd = "find /data/adb/modules /data/adb/ksu/modules -maxdepth 4 \\( -iname '*webroot*' -o -iname 'webroot' -o -iname '*webui*' -o -name 'index.html' \\) -print 2>/dev/null | head -n 80 || true"
+        val out = runProcess(listOf("su", "-c", cmd), 4000).output
+        return out.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.map {
+            ModuleInfo(it.substringAfterLast('/'), "KSU WebUI", "发现", "可作为 KernelSU/Magisk 模块 WebUI 入口线索", it)
+        }.toList().ifEmpty {
+            listOf(ModuleInfo("未发现 KSU WebUI", "KSU WebUI", "空", "未发现 webroot/index.html/webui 线索", "/data/adb"))
+        }
+    }
+
+    private fun scanSecurityChecks(): List<SecurityCheck> {
+        val mounts = runProcess(listOf("su", "-c", "mount | grep -E ' /(system|vendor|product|system_ext|odm) ' || true"), 2000).output
+        val rw = mounts.lineSequence().any { it.contains(" rw,") || it.contains(" rw ") }
+        val su = runProcess(listOf("su", "-c", "command -v su || true"), 1000).output
+        return listOf(
+            SecurityCheck("默认工作目录", "可用", "/data/adb，可在主页自定义"),
+            SecurityCheck("系统分区挂载", if (rw) "风险" else "正常", if (rw) "系统分区疑似 rw" else "系统分区未发现 rw"),
+            SecurityCheck("su 路径", if (su.isBlank()) "未知" else "存在", su.ifBlank { "command -v su 无输出" })
+        )
+    }
+
+    private fun runProcess(command: List<String>, timeoutMs: Long): ShellResult {
+        return runCatching {
+            val p = ProcessBuilder(command).redirectErrorStream(false).start()
+            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                p.destroyForcibly()
+                return ShellResult("", "命令超时", -2)
+            }
+            ShellResult(
+                BufferedReader(InputStreamReader(p.inputStream)).readText().trim(),
+                BufferedReader(InputStreamReader(p.errorStream)).readText().trim(),
+                p.exitValue()
+            )
+        }.getOrElse { ShellResult("", it.message.orEmpty(), -1) }
+    }
+
+    private fun String.lineValue(key: String): String? =
+        lineSequence().firstOrNull { it.startsWith("$key=") }?.substringAfter('=')?.trim()
+}
+
+data class RootStatus(val available: Boolean, val manager: String, val selinux: String, val raw: String)
+
+data class ModuleInfo(
+    val name: String,
+    val type: String,
+    val state: String,
+    val description: String,
+    val path: String = ""
+)
+
+data class ModuleScan(
+    val rootModules: List<ModuleInfo>,
+    val lspModules: List<ModuleInfo>,
+    val ksuWebUi: List<ModuleInfo>,
+    val securityChecks: List<SecurityCheck>
+)
+
+data class SecurityCheck(val name: String, val state: String, val detail: String)
+data class ProtectionDecision(val blocked: Boolean, val reason: String)
+data class CommandResult(val blocked: Boolean, val output: String, val exitCode: Int, val pid: Long?)
+private data class ShellResult(val output: String, val error: String, val exitCode: Int)
