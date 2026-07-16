@@ -1,0 +1,288 @@
+package com.java.myapplication
+
+import android.content.Context
+import android.content.pm.PackageManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
+
+class RootMonitorController(private val context: Context) {
+    private val protectedDeleteTargets = listOf(
+        "/system",
+        "/system_ext",
+        "/product",
+        "/vendor",
+        "/odm",
+        "/oem",
+        "/data/adb",
+        "/data/system",
+        "/"
+    )
+
+    private val dangerousTokens = listOf(
+        "rm -rf /",
+        "rm -fr /",
+        "rm -r /system",
+        "rm -rf /system",
+        "busybox rm -rf /",
+        "toybox rm -rf /",
+        "mkfs.",
+        "dd if=",
+        "mount -o rw,remount /",
+        "mount -o rw,remount /system",
+        "blockdev --setrw",
+        "fastboot erase",
+        "magisk --remove-modules"
+    )
+
+    suspend fun checkRoot(): RootStatus = withContext(Dispatchers.IO) {
+        val result = runShell(listOf("su", "-c", "id; getenforce; command -v magisk || true"), 3500)
+        val rooted = result.output.contains("uid=0") || result.output.contains("Magisk", ignoreCase = true)
+        RootStatus(
+            available = rooted,
+            manager = when {
+                result.output.contains("magisk", ignoreCase = true) -> "Magisk / su"
+                rooted -> "su"
+                else -> "未授权"
+            },
+            selinux = result.output.lineSequence().firstOrNull { it == "Enforcing" || it == "Permissive" } ?: "未知",
+            raw = result.output.ifBlank { result.error.ifBlank { "无 root 响应" } }
+        )
+    }
+
+    suspend fun inspectTarget(input: String): TargetInspection = withContext(Dispatchers.IO) {
+        val query = input.trim()
+        if (query.isBlank()) {
+            return@withContext TargetInspection.empty("请输入包名或应用名")
+        }
+
+        val packageName = resolvePackageName(query)
+        if (packageName == null) {
+            return@withContext TargetInspection.empty("未找到目标: $query")
+        }
+
+        val pm = context.packageManager
+        val appInfo = runCatching { pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA) }.getOrNull()
+        val label = appInfo?.loadLabel(pm)?.toString() ?: packageName
+        val permissions = runCatching {
+            pm.getPackageInfo(packageName, PackageManager.GET_PERMISSIONS).requestedPermissions?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+
+        val appOps = readAppOps(packageName)
+        val moduleSignals = readModuleSignals(packageName)
+        val events = buildEvents(packageName, permissions, appOps, moduleSignals)
+
+        TargetInspection(
+            packageName = packageName,
+            label = label,
+            permissionCount = permissions.size,
+            riskScore = calculateRiskScore(permissions, appOps, moduleSignals),
+            requestedPermissions = permissions,
+            appOps = appOps,
+            moduleSignals = moduleSignals,
+            events = events,
+            note = "权限调用来自 Manifest/AppOps 快照；实时 API 调用需要配合 LSPosed/Xposed hook 模块上报。"
+        )
+    }
+
+    suspend fun scanModules(): List<ModuleInfo> = withContext(Dispatchers.IO) {
+        val lsposed = runShell(listOf("su", "-c", "ls -1 /data/adb/lspd/modules 2>/dev/null || true"), 2500).output
+        val magisk = runShell(listOf("su", "-c", "find /data/adb/modules -maxdepth 2 -name module.prop -print 2>/dev/null || true"), 3000).output
+        val modules = mutableListOf<ModuleInfo>()
+
+        lsposed.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .forEach { modules += ModuleInfo(it, "LSPosed/Xposed", "启用", "Hook 模块，建议开启调用上报") }
+
+        magisk.lineSequence()
+            .map { it.trim() }
+            .filter { it.endsWith("module.prop") }
+            .forEach { propPath ->
+                val content = runShell(listOf("su", "-c", "cat '$propPath' 2>/dev/null"), 1500).output
+                val id = content.lineValue("id") ?: propPath.substringBeforeLast('/').substringAfterLast('/')
+                val name = content.lineValue("name") ?: id
+                val desc = content.lineValue("description") ?: "Magisk 模块"
+                modules += ModuleInfo(name, "Magisk", "已安装", desc)
+            }
+
+        if (modules.isEmpty()) {
+            listOf(
+                ModuleInfo("LSPosed bridge", "接口占位", "未接入", "安装 companion hook 后可记录权限 API 调用栈"),
+                ModuleInfo("Super Guard", "内置策略", "就绪", "拦截本应用发起的危险 root 命令")
+            )
+        } else {
+            modules.distinctBy { it.name + it.type }
+        }
+    }
+
+    fun evaluateCommand(command: String, superProtection: Boolean): ProtectionDecision {
+        val normalized = command.trim().replace(Regex("\\s+"), " ")
+        if (!superProtection) return ProtectionDecision(false, "超级保护未启用")
+        val lower = normalized.lowercase()
+        val token = dangerousTokens.firstOrNull { lower.contains(it) }
+        if (token != null) {
+            return ProtectionDecision(true, "命中危险规则: $token")
+        }
+        val target = protectedDeleteTargets.firstOrNull { target ->
+            Regex("(^|[;&| ]+)rm\\s+(-[a-zA-Z]*[rf][a-zA-Z]*|-[a-zA-Z]*[fr][a-zA-Z]*)\\s+${Regex.escape(target)}(/| |$)")
+                .containsMatchIn(lower)
+        }
+        return if (target != null) ProtectionDecision(true, "阻止删除受保护路径: $target") else ProtectionDecision(false, "命令未命中保护规则")
+    }
+
+    suspend fun runGuardedRootCommand(command: String, superProtection: Boolean): CommandResult = withContext(Dispatchers.IO) {
+        val decision = evaluateCommand(command, superProtection)
+        if (decision.blocked) {
+            return@withContext CommandResult(blocked = true, output = "已终止: ${decision.reason}", exitCode = -1)
+        }
+        val result = runShell(listOf("su", "-c", command), 5000)
+        CommandResult(blocked = false, output = result.output.ifBlank { result.error }, exitCode = result.exitCode)
+    }
+
+    private fun resolvePackageName(query: String): String? {
+        val pm = context.packageManager
+        if (runCatching { pm.getPackageInfo(query, 0) }.isSuccess) return query
+        return pm.getInstalledApplications(PackageManager.GET_META_DATA).firstOrNull { info ->
+            val label = runCatching { info.loadLabel(pm).toString() }.getOrDefault("")
+            label.contains(query, ignoreCase = true) || info.packageName.contains(query, ignoreCase = true)
+        }?.packageName
+    }
+
+    private fun readAppOps(packageName: String): List<String> {
+        val result = runShell(listOf("su", "-c", "cmd appops get '$packageName' 2>/dev/null || appops get '$packageName' 2>/dev/null"), 3000)
+        return result.output.lineSequence()
+            .map { it.trim() }
+            .filter { it.contains(":") || it.contains("allow", ignoreCase = true) || it.contains("deny", ignoreCase = true) }
+            .take(24)
+            .toList()
+    }
+
+    private fun readModuleSignals(packageName: String): List<String> {
+        val command = "grep -R \"$packageName\" /data/adb/lspd /data/adb/modules 2>/dev/null | head -n 12 || true"
+        val result = runShell(listOf("su", "-c", command), 2500)
+        return result.output.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+    }
+
+    private fun buildEvents(
+        packageName: String,
+        permissions: List<String>,
+        appOps: List<String>,
+        moduleSignals: List<String>
+    ): List<MonitorEvent> {
+        val sensitive = permissions.filter { permission ->
+            listOf("CAMERA", "LOCATION", "RECORD_AUDIO", "READ_SMS", "CONTACTS", "PHONE", "STORAGE", "QUERY_ALL_PACKAGES")
+                .any { permission.contains(it, ignoreCase = true) }
+        }.take(8).map {
+            MonitorEvent("Manifest", it.substringAfterLast('.'), "目标声明敏感权限", "中")
+        }
+
+        val ops = appOps.take(8).map {
+            MonitorEvent("AppOps", it.substringBefore(':'), it, if (it.contains("allow", true)) "中" else "低")
+        }
+
+        val hooks = moduleSignals.take(5).map {
+            MonitorEvent("模块", packageName, it.take(90), "高")
+        }
+
+        val fallback = if (sensitive.isEmpty() && ops.isEmpty() && hooks.isEmpty()) {
+            listOf(MonitorEvent("系统", packageName, "未发现敏感权限快照，等待实时 hook 数据", "低"))
+        } else emptyList()
+
+        return hooks + ops + sensitive + fallback
+    }
+
+    private fun calculateRiskScore(permissions: List<String>, appOps: List<String>, moduleSignals: List<String>): Int {
+        var score = 18 + moduleSignals.size * 9 + appOps.count { it.contains("allow", true) } * 5
+        score += permissions.count { permission ->
+            listOf("CAMERA", "LOCATION", "RECORD_AUDIO", "READ_SMS", "CONTACTS", "PHONE", "QUERY_ALL_PACKAGES")
+                .any { permission.contains(it, ignoreCase = true) }
+        } * 7
+        return score.coerceIn(0, 100)
+    }
+
+    private fun runShell(command: List<String>, timeoutMs: Long): ShellResult {
+        return runCatching {
+            val process = ProcessBuilder(command).redirectErrorStream(false).start()
+            val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return ShellResult("", "命令超时", -2)
+            }
+            val output = BufferedReader(InputStreamReader(process.inputStream)).readText().trim()
+            val error = BufferedReader(InputStreamReader(process.errorStream)).readText().trim()
+            ShellResult(output, error, process.exitValue())
+        }.getOrElse { ShellResult("", it.message.orEmpty(), -1) }
+    }
+
+    private fun String.lineValue(key: String): String? = lineSequence()
+        .firstOrNull { it.startsWith("$key=") }
+        ?.substringAfter('=')
+        ?.trim()
+}
+
+data class RootStatus(
+    val available: Boolean,
+    val manager: String,
+    val selinux: String,
+    val raw: String
+)
+
+data class TargetInspection(
+    val packageName: String,
+    val label: String,
+    val permissionCount: Int,
+    val riskScore: Int,
+    val requestedPermissions: List<String>,
+    val appOps: List<String>,
+    val moduleSignals: List<String>,
+    val events: List<MonitorEvent>,
+    val note: String
+) {
+    companion object {
+        fun empty(message: String) = TargetInspection(
+            packageName = "-",
+            label = message,
+            permissionCount = 0,
+            riskScore = 0,
+            requestedPermissions = emptyList(),
+            appOps = emptyList(),
+            moduleSignals = emptyList(),
+            events = emptyList(),
+            note = message
+        )
+    }
+}
+
+data class MonitorEvent(
+    val source: String,
+    val name: String,
+    val detail: String,
+    val severity: String
+)
+
+data class ModuleInfo(
+    val name: String,
+    val type: String,
+    val state: String,
+    val description: String
+)
+
+data class ProtectionDecision(
+    val blocked: Boolean,
+    val reason: String
+)
+
+data class CommandResult(
+    val blocked: Boolean,
+    val output: String,
+    val exitCode: Int
+)
+
+private data class ShellResult(
+    val output: String,
+    val error: String,
+    val exitCode: Int
+)
